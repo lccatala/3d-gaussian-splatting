@@ -2,15 +2,14 @@ import os
 import argparse
 import math
 
+import numpy as np
 import mathutils
 import bpy
 
 
 def _save_matrix(matrix, filepath: str) -> None:
-        with open(filepath, "w") as f:
-            for row in matrix:
-                f.write(" ".join(f"{v:.6f}" for v in row) + "\n")
-        print(f"Saved\n{matrix}")
+    np.save(filepath, matrix)
+    print(f"Saved\n{matrix}")
 
 def generate_images_and_matrices(scene_path: str, num_cameras: int, output_dir: str):
     bpy.ops.wm.open_mainfile(filepath=scene_path) #type: ignore
@@ -43,12 +42,12 @@ def generate_images_and_matrices(scene_path: str, num_cameras: int, output_dir: 
 
         # Save the camera view matrix
         view_matrix = camera.matrix_world.inverted()
-        view_matrix_path = os.path.join(output_dir, f"camera_{i:03d}_view_matrix.txt")
+        view_matrix_path = os.path.join(output_dir, f"camera_{i:03d}_view_matrix.npy")
         _save_matrix(view_matrix, view_matrix_path)
 
         # Save the camera projection matrix
         projection_matrix = camera.calc_matrix_camera(bpy.context.view_layer.depsgraph) #type: ignore
-        projection_matrix_path = os.path.join(output_dir, f"camera_{i:03d}_projection_matrix.txt")
+        projection_matrix_path = os.path.join(output_dir, f"camera_{i:03d}_projection_matrix.npy")
         _save_matrix(projection_matrix, projection_matrix_path)
 
         bpy.data.objects.remove(camera, do_unlink=True) #type: ignore

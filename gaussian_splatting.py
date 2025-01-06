@@ -5,14 +5,93 @@ from typing import Optional
 
 import numpy as np
 import torch
-from torch.cuda import is_available
 import torch.nn as nn
 from PIL import Image
 import cv2
 
+from memory_tracker import MemoryTracker
+
 
 DEVICE = "cpu"
 
+def add_memory_tracking_to_render(model):
+    """Wrap the render method with memory tracking"""
+    original_render = model.render
+    tracker = MemoryTracker()
+    
+    def render_with_tracking(camera_matrix, image_size, chunk_size=1000):
+        print("\nStarting render - Initial memory state:")
+        initial_tensors = tracker.track_tensors()
+        tracker.print_tensor_sizes(initial_tensors)
+        
+        # Run the original render
+        result = original_render(camera_matrix, image_size, chunk_size)
+        
+        print("\nAfter render - Final memory state:")
+        final_tensors = tracker.track_tensors()
+        tracker.print_tensor_sizes(final_tensors)
+        
+        print("\nPotential memory leaks (new tensors):")
+        leaks = tracker.find_tensor_leaks(initial_tensors, final_tensors)
+        tracker.print_tensor_sizes(leaks)
+        
+        return result
+    
+    # Replace the original render method with our tracked version
+    model.render = render_with_tracking
+    
+    return model
+
+def track_gaussian_processing(model):
+    """Track memory during Gaussian processing"""
+    tracker = MemoryTracker()
+    
+    # Modify the render method to track per-Gaussian memory
+    original_render = model.render
+    
+    def render_with_gaussian_tracking(camera_matrix, image_size, chunk_size=1000):
+        height, width = image_size
+        device = camera_matrix.device
+        
+        # Initial cleanup
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        print("\nInitial memory state:")
+        initial_tensors = tracker.track_tensors()
+        tracker.print_tensor_sizes(initial_tensors)
+        
+        rendered_image = torch.zeros(height, width, 3, device=device)
+        accumulated_alpha = torch.zeros(height, width, device=device)
+        
+        # Process Gaussians with tracking
+        for idx, gaussian in enumerate(model.gaussians):
+            if idx % 100 == 0:
+                print(f"\nProcessing Gaussian {idx}")
+                current_tensors = tracker.track_tensors()
+                
+                print(f"\nMemory state after Gaussian {idx}:")
+                tracker.print_tensor_sizes(current_tensors)
+                
+                leaks = tracker.find_tensor_leaks(initial_tensors, current_tensors)
+                if leaks:
+                    print(f"\nNew tensors after Gaussian {idx}:")
+                    tracker.print_tensor_sizes(leaks)
+            
+            # Process the Gaussian...
+            # (Your existing Gaussian processing code here)
+            
+            # Force cleanup
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+        
+        return rendered_image
+    
+    # Replace the original render method
+    model.render = render_with_gaussian_tracking
+    
+    return model
 class GaussianSplat:
     def __init__(
         self, 
@@ -85,7 +164,7 @@ class GaussianSplattingModel:
         
         return pos_2d, cov_2d
     
-    def compute_2d_gaussian(self, mean_2d, cov_2d, image_size, chunk_size=500):
+    def compute_2d_gaussian(self, mean_2d, cov_2d, image_size):
         """
         Compute 2D Gaussian parameters for rendering
         
@@ -93,41 +172,22 @@ class GaussianSplattingModel:
             mean_2d (torch.Tensor): 2D projected position
             cov_2d (torch.Tensor): 2D covariance matrix
             image_size (tuple): Target image dimensions
-            chunk_size (int): Size of chunks to process as once
         
         Returns:
             torch.Tensor: 2D Gaussian evaluation on pixel grid
         """
-        height, width = image_size
-        gaussian = torch.zeros(height, width, device=DEVICE)
-
-        # Add small epsilon to avoid singular matrix
+        x = torch.arange(image_size[1], device=DEVICE)
+        y = torch.arange(image_size[0], device=DEVICE)
+        Y, X = torch.meshgrid(y, x, indexing="ij")
+        pixels = torch.stack([X, Y], dim=-1)
+        
+        # Compute Gaussian values for each pixel
+        diff = pixels - mean_2d.unsqueeze(0).unsqueeze(0)
         inv_cov = torch.inverse(cov_2d + torch.eye(2, device=DEVICE) * 1e-5)
-
-        # Process in vertical chunks
-        for y_start in range(0, height, chunk_size):
-            torch.cuda.empty_cache()
-
-            y_end = min(y_start + chunk_size, height)
-            y_coords = torch.arange(y_start, y_end, device=DEVICE)
-
-            # Horizontal chunks in this vertical chunk
-            for x_start in range(0, width, chunk_size):
-                x_end = min(x_start + chunk_size, width)
-                x_coords = torch.arange(x_start, x_end, device=DEVICE)
-
-                Y, X = torch.meshgrid(y_coords, x_coords, indexing="ij")
-                pixels = torch.stack([X, Y], dim=-1)
-
-                # Gaussian values for chunk
-                diff = pixels - mean_2d.unsqueeze(0).unsqueeze(0)
-                mahalanobis = torch.sum((diff @ inv_cov) * diff, dim=-1)
-                chunk_gaussian = torch.exp(-0.5 * mahalanobis)
-
-                gaussian[y_start:y_end, x_start:x_end] = chunk_gaussian
-                del pixels, diff, mahalanobis, chunk_gaussian
+        mahalanobis = torch.sum((diff @ inv_cov) * diff, dim=-1)
+        gaussian = torch.exp(-0.5 * mahalanobis)
+        
         return gaussian
-
 
     def render(self, camera_matrix, image_size):
         """
@@ -140,9 +200,6 @@ class GaussianSplattingModel:
         Returns:
             torch.Tensor: Rendered image
         """
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
         rendered_image = torch.zeros(*image_size, 3, device=DEVICE)
         accumulated_alpha = torch.zeros(*image_size, device=DEVICE)
         
@@ -187,9 +244,9 @@ def create_loss_function():
 
 def optimize_gaussians(
     model: GaussianSplattingModel, 
-    target_images, 
-    camera_matrices, 
-    num_iterations: int = 10000):
+    target_images: list, 
+    camera_matrices: list, 
+    num_iterations: int = 1000):
     """
     Optimize Gaussian parameters to match target images
     
@@ -203,9 +260,6 @@ def optimize_gaussians(
     loss_fn = create_loss_function()
     
     for iteration in range(num_iterations):
-        if iteration % 10 == 0 and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
         optimizer.zero_grad()
         total_loss: torch.Tensor = torch.tensor(0.0, requires_grad=True, device=DEVICE)
         
@@ -220,10 +274,6 @@ def optimize_gaussians(
         
         if iteration % 100 == 0:
             print(f"Iteration {iteration}, Loss: {total_loss.item():.4f}")
-            cv2.imwrite(f"{iteration}.png", rendered_image.cpu().detach().numpy())
-
-    torch.cuda.empty_cache()
-    gc.collect()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="3D Gaussian Splatting main script")
@@ -233,17 +283,17 @@ if __name__ == "__main__":
 
     if torch.cuda.is_available():
         DEVICE = "cuda"
-        torch.cuda.empty_cache()
-        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
     elif torch.backends.mps.is_available():
         DEVICE = "mps"
 
     model = GaussianSplattingModel(num_gaussians=args.num_gaussians)
+    # model = add_memory_tracking_to_render(model)
+    # model = track_gaussian_processing(model)
 
     target_images = []
     camera_matrices = []
     data_files = os.listdir(args.input_dir)
-    image_files = [f for f in data_files if f.endswith(".png")]
+    image_files: list = [f for f in data_files if f.endswith(".png")]
     for image_file in image_files:
         projection_matrix_file = f"{image_file.split('.')[0]}_projection_matrix.npy"
         pm_filepath = os.path.join(args.input_dir, projection_matrix_file)
